@@ -1,0 +1,1303 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SPACE INVADERS</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; overflow: hidden; background: #05070c;
+    color: #9fb3c8;
+    font-family: "Segoe UI", "Yu Gothic UI", Meiryo, system-ui, sans-serif;
+    -webkit-user-select: none; user-select: none;
+  }
+  #app {
+    height: 100%; display: flex; flex-direction: column; gap: 10px;
+    align-items: center; justify-content: center;
+  }
+  #wrap { width: min(96vw, 132vh, 800px); aspect-ratio: 4 / 3; }
+  canvas#screen {
+    width: 100%; height: 100%; display: block; background: #000;
+    image-rendering: pixelated; image-rendering: crisp-edges;
+    touch-action: none; cursor: crosshair; border-radius: 4px;
+    box-shadow: 0 0 0 1px #16283a, 0 14px 44px rgba(0, 0, 0, .75), 0 0 70px rgba(70, 255, 170, .07);
+  }
+  #hint { font-size: 12px; letter-spacing: .03em; opacity: .62; text-align: center; padding: 0 10px; line-height: 1.6; }
+  #hint b { color: #6ff0b0; font-weight: 600; }
+  @media (max-width: 720px) { #hint { font-size: 11px; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="wrap"><canvas id="screen" width="800" height="600"></canvas></div>
+  <div id="hint">
+    <b>&larr; &rarr;</b> / <b>A D</b> 移動　<b>SPACE</b> 射撃　<b>P</b> 一時停止　<b>M</b> サウンド　<b>R</b> リセット　
+    タッチ：ドラッグで移動 / タップで射撃
+  </div>
+</div>
+
+<!-- =========================================================================
+     invader-core : 純粋なゲームロジック（DOM / Canvas / Audio に依存しない）
+     描画・入力・サウンドは下の invader-game が担当する。
+     tests.html はこの script ブロックを読み込んで自動テストを実行する。
+     ========================================================================= -->
+<script id="invader-core">
+(function (root) {
+  'use strict';
+
+  var CONFIG = {
+    WIDTH: 800,
+    HEIGHT: 600,
+    PLAYER: { W: 39, H: 24, SPEED: 260, Y: 536, LIVES: 3, RESPAWN: 0.9,
+              MAX_BULLETS: 1, BULLET_SPEED: 620, BULLET_W: 3, BULLET_H: 14, MIN_X: 10 },
+    ARMY: { ROWS: 5, COLS: 11, CELL_W: 44, CELL_H: 34, TOP: 88, START_X: 162,
+            MARGIN: 20, DROP: 16, STEP_X: 10, BASE_INTERVAL: 0.34, MIN_INTERVAL: 0.05,
+            LEVEL_SPEEDUP: 0.14 },
+    ENEMY_FIRE: { BASE_INTERVAL: 1.3, MIN_INTERVAL: 0.4, MAX: 3, SPEED: 250, W: 3, H: 14 },
+    UFO: { W: 48, H: 21, Y: 52, SPEED: 120, MIN_DELAY: 13, MAX_DELAY: 25,
+           TABLE: [{ pts: 50, w: 3 }, { pts: 100, w: 3 }, { pts: 150, w: 2 }, { pts: 300, w: 1 }] },
+    BUNKER: { COUNT: 4, CELL: 3, COLS: 22, ROWS: 16, Y: 452 },
+    POINTS: { squid: 30, crab: 20, octopus: 10 },
+    SPRITE: { squid: { w: 24, h: 24 }, crab: { w: 33, h: 24 }, octopus: { w: 36, h: 24 } },
+    EXTRA_LIFE_EVERY: 1500,
+    MAX_LIVES: 6,
+    LEVEL_BONUS: 50,
+    SWEEP: 3,
+    MIN_INVADERS_FOR_UFO: 4
+  };
+
+  var KIND_BY_ROW = ['squid', 'crab', 'crab', 'octopus', 'octopus'];
+
+  function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+  function aabb(a, b) {
+    return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+  }
+  function randRange(state, lo, hi) { return lo + state.rng() * (hi - lo); }
+
+  /* ---------------------------------------------------------------- bunkers */
+
+  function createBunker(x, y) {
+    var B = CONFIG.BUNKER, grid = new Uint8Array(B.COLS * B.ROWS);
+    for (var r = 0; r < B.ROWS; r++) {
+      for (var c = 0; c < B.COLS; c++) {
+        var solid = 1;
+        if (r < 5 && (c < 5 - r || c > B.COLS - 6 + r)) solid = 0;   // 肩の斜め
+        if (r > B.ROWS - 6 && c >= 8 && c <= 13) solid = 0;          // 脚の間
+        grid[r * B.COLS + c] = solid;
+      }
+    }
+    return { x: x, y: y, w: B.COLS * B.CELL, h: B.ROWS * B.CELL,
+             cols: B.COLS, rows: B.ROWS, cell: B.CELL, grid: grid };
+  }
+
+  function createBunkers() {
+    var B = CONFIG.BUNKER, w = B.COLS * B.CELL, list = [];
+    for (var i = 0; i < B.COUNT; i++) {
+      var x = Math.round((CONFIG.WIDTH - B.COUNT * w) / (B.COUNT + 1) * (i + 1) + w * i);
+      list.push(createBunker(x, B.Y));
+    }
+    return list;
+  }
+
+  function bunkerSolid(bk, cx, cy) {
+    if (cx < 0 || cy < 0 || cx >= bk.cols || cy >= bk.rows) return false;
+    return bk.grid[cy * bk.cols + cx] === 1;
+  }
+
+  /** 着弾点を中心に穴を開ける。削ったセル数を返す。 */
+  function carveBunker(bk, cx, cy, radius) {
+    var r2 = radius * radius + radius * 0.5, removed = 0;
+    for (var dy = -radius; dy <= radius; dy++) {
+      for (var dx = -radius; dx <= radius; dx++) {
+        if (dx * dx + dy * dy > r2) continue;
+        var x = cx + dx, y = cy + dy;
+        if (x < 0 || y < 0 || x >= bk.cols || y >= bk.rows) continue;
+        var i = y * bk.cols + x;
+        if (bk.grid[i]) { bk.grid[i] = 0; removed++; }
+      }
+    }
+    return removed;
+  }
+
+  /** 矩形（インベーダー本体など）と重なるバンカーを削る。 */
+  function eraseBunkersInRect(bunkers, rect) {
+    var removed = 0;
+    for (var i = 0; i < bunkers.length; i++) {
+      var bk = bunkers[i];
+      if (!aabb(rect, bk)) continue;
+      var c0 = Math.max(0, Math.floor((rect.x - bk.x) / bk.cell));
+      var c1 = Math.min(bk.cols - 1, Math.floor((rect.x + rect.w - 1 - bk.x) / bk.cell));
+      var r0 = Math.max(0, Math.floor((rect.y - bk.y) / bk.cell));
+      var r1 = Math.min(bk.rows - 1, Math.floor((rect.y + rect.h - 1 - bk.y) / bk.cell));
+      for (var r = r0; r <= r1; r++) {
+        for (var c = c0; c <= c1; c++) {
+          var idx = r * bk.cols + c;
+          if (bk.grid[idx]) { bk.grid[idx] = 0; removed++; }
+        }
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * 弾とバンカーの衝突判定。
+   * dirUp=true（自機弾＝上向き）は下の行から、false（敵弾＝下向き）は上の行から走査し、
+   * 最初に当たったセルを返す。当たらなければ null。
+   */
+  function bulletHitsBunker(bunkers, b, dirUp) {
+    for (var i = 0; i < bunkers.length; i++) {
+      var bk = bunkers[i];
+      if (!aabb(b, bk)) continue;
+      var c0 = Math.max(0, Math.floor((b.x - bk.x) / bk.cell));
+      var c1 = Math.min(bk.cols - 1, Math.floor((b.x + b.w - 1 - bk.x) / bk.cell));
+      var r0 = Math.max(0, Math.floor((b.y - bk.y) / bk.cell));
+      var r1 = Math.min(bk.rows - 1, Math.floor((b.y + b.h - 1 - bk.y) / bk.cell));
+      var r, c;
+      if (dirUp) {
+        for (r = r1; r >= r0; r--) {
+          for (c = c0; c <= c1; c++) if (bunkerSolid(bk, c, r)) return { bunker: bk, cx: c, cy: r };
+        }
+      } else {
+        for (r = r0; r <= r1; r++) {
+          for (c = c0; c <= c1; c++) if (bunkerSolid(bk, c, r)) return { bunker: bk, cx: c, cy: r };
+        }
+      }
+    }
+    return null;
+  }
+
+  /* ------------------------------------------------------------ invader army */
+
+  function createArmy(level) {
+    var A = CONFIG.ARMY, invaders = [], r, c;
+    for (r = 0; r < A.ROWS; r++) {
+      var kind = KIND_BY_ROW[r] || 'octopus';
+      for (c = 0; c < A.COLS; c++) {
+        invaders.push({ row: r, col: c, kind: kind, pts: CONFIG.POINTS[kind], alive: true });
+      }
+    }
+    return { invaders: invaders, total: invaders.length, x: A.START_X, y: A.TOP,
+             dir: 1, stepTimer: 0, frame: 0, drops: 0, level: level || 1 };
+  }
+
+  function invaderRect(army, inv) {
+    var A = CONFIG.ARMY, s = CONFIG.SPRITE[inv.kind];
+    return { x: army.x + inv.col * A.CELL_W + (A.CELL_W - s.w) / 2,
+             y: army.y + inv.row * A.CELL_H, w: s.w, h: s.h };
+  }
+
+  function aliveCount(army) {
+    var n = 0;
+    for (var i = 0; i < army.invaders.length; i++) if (army.invaders[i].alive) n++;
+    return n;
+  }
+
+  /** 生存インベーダー全体の外接矩形（全滅時は null）。 */
+  function armyBounds(army) {
+    var minX = Infinity, maxX = -Infinity, maxY = -Infinity, found = false;
+    for (var i = 0; i < army.invaders.length; i++) {
+      var inv = army.invaders[i];
+      if (!inv.alive) continue;
+      var r = invaderRect(army, inv);
+      if (r.x < minX) minX = r.x;
+      if (r.x + r.w > maxX) maxX = r.x + r.w;
+      if (r.y + r.h > maxY) maxY = r.y + r.h;
+      found = true;
+    }
+    return found ? { minX: minX, maxX: maxX, maxY: maxY } : null;
+  }
+
+  /** 残数が減るほど、レベルが上がるほど歩調が速くなる。 */
+  function stepIntervalFor(army) {
+    var A = CONFIG.ARMY;
+    var ratio = aliveCount(army) / army.total;
+    var base = A.MIN_INTERVAL + (A.BASE_INTERVAL - A.MIN_INTERVAL) * ratio;
+    var mul = Math.pow(1 + A.LEVEL_SPEEDUP, army.level - 1);
+    return Math.max(0.03, base / mul);
+  }
+
+  /** 1 ステップ分だけ隊列を動かす。端に着いたら反転して降下する。 */
+  function stepArmy(army) {
+    var A = CONFIG.ARMY, b = armyBounds(army);
+    if (!b) return null;
+    var event = { type: 'invaderStep' };
+    var nx = b.minX + A.STEP_X * army.dir;
+    var nxr = b.maxX + A.STEP_X * army.dir;
+    if (nx < A.MARGIN || nxr > CONFIG.WIDTH - A.MARGIN) {
+      army.y += A.DROP;
+      army.dir *= -1;
+      army.drops++;
+      event.type = 'invaderDrop';
+    } else {
+      army.x += A.STEP_X * army.dir;
+    }
+    army.frame ^= 1;
+    return event;
+  }
+
+  /* ------------------------------------------------------------------ state */
+
+  function createState(opts) {
+    opts = opts || {};
+    var P = CONFIG.PLAYER;
+    return {
+      status: 'title',          // title | playing | paused | dying | levelclear | gameover
+      time: 0, timer: 0,
+      score: 0, highScore: opts.highScore || 0, lives: P.LIVES, level: 1,
+      nextExtraLife: CONFIG.EXTRA_LIFE_EVERY,
+      player: { x: Math.round((CONFIG.WIDTH - P.W) / 2), y: P.Y, w: P.W, h: P.H, alive: true },
+      bullets: [], enemyBullets: [],
+      army: createArmy(1), bunkers: createBunkers(),
+      ufo: null, ufoTimer: 999,
+      fireTimer: CONFIG.ENEMY_FIRE.BASE_INTERVAL,
+      stepTone: 0, lastBonus: 0,
+      events: [],
+      rng: opts.rng || Math.random
+    };
+  }
+
+  function emit(state, type, extra) {
+    var ev = { type: type };
+    if (extra) for (var k in extra) if (extra.hasOwnProperty(k)) ev[k] = extra[k];
+    state.events.push(ev);
+    return ev;
+  }
+
+  function makeBullet(state, x, y, up) {
+    var P = CONFIG.PLAYER, E = CONFIG.ENEMY_FIRE;
+    return up
+      ? { x: x - P.BULLET_W / 2, y: y, w: P.BULLET_W, h: P.BULLET_H, up: true }
+      : { x: x - E.W / 2, y: y, w: E.W, h: E.H, up: false };
+  }
+
+  function startLevel(state, level) {
+    state.level = level;
+    state.army = createArmy(level);
+    state.bunkers = createBunkers();
+    state.bullets.length = 0;
+    state.enemyBullets.length = 0;
+    state.ufo = null;
+    state.ufoTimer = randRange(state, CONFIG.UFO.MIN_DELAY, CONFIG.UFO.MAX_DELAY);
+    state.fireTimer = CONFIG.ENEMY_FIRE.BASE_INTERVAL;
+    state.stepTone = 0;
+    state.player.x = Math.round((CONFIG.WIDTH - CONFIG.PLAYER.W) / 2);
+    state.player.alive = true;
+  }
+
+  function startGame(state) {
+    state.score = 0;
+    state.lives = CONFIG.PLAYER.LIVES;
+    state.nextExtraLife = CONFIG.EXTRA_LIFE_EVERY;
+    startLevel(state, 1);
+    state.status = 'playing';
+    state.timer = 0;
+    return state;
+  }
+
+  function togglePause(state) {
+    if (state.status === 'playing') state.status = 'paused';
+    else if (state.status === 'paused') state.status = 'playing';
+    return state.status;
+  }
+
+  function addScore(state, pts) {
+    state.score += pts;
+    if (state.score > state.highScore) state.highScore = state.score;
+    while (state.score >= state.nextExtraLife) {
+      state.nextExtraLife += CONFIG.EXTRA_LIFE_EVERY;
+      if (state.lives < CONFIG.MAX_LIVES) {
+        state.lives++;
+        emit(state, 'extraLife', { lives: state.lives });
+      }
+    }
+    return state.score;
+  }
+
+  /* ----------------------------------------------------------------- player */
+
+  function updatePlayer(state, dt, input) {
+    var P = CONFIG.PLAYER, p = state.player;
+    if (!p.alive) return;
+    var dir = 0;
+    if (input.left) dir -= 1;
+    if (input.right) dir += 1;
+    if (dir) {
+      p.x += dir * P.SPEED * dt;
+    } else if (typeof input.pointerX === 'number') {
+      var target = input.pointerX - p.w / 2;
+      var d = target - p.x;
+      if (Math.abs(d) < 3) p.x = target;
+      else p.x += Math.sign(d) * Math.min(Math.abs(d), P.SPEED * dt);
+    }
+    p.x = clamp(p.x, P.MIN_X, CONFIG.WIDTH - p.w - P.MIN_X);
+
+    if (input.fire && state.bullets.length < P.MAX_BULLETS) {
+      state.bullets.push(makeBullet(state, p.x + p.w / 2, p.y - P.BULLET_H, true));
+      emit(state, 'playerShoot');
+      return true;
+    }
+    return false;
+  }
+
+  function killPlayer(state) {
+    var p = state.player;
+    if (!p.alive) return;
+    p.alive = false;
+    state.lives--;
+    state.enemyBullets.length = 0;
+    emit(state, 'playerKilled', { x: p.x + p.w / 2, y: p.y + p.h / 2, lives: state.lives });
+    state.status = 'dying';
+    state.timer = CONFIG.PLAYER.RESPAWN;
+  }
+
+  /* ---------------------------------------------------------------- bullets */
+
+  function firstInvaderHit(state, b) {
+    var army = state.army;
+    for (var i = 0; i < army.invaders.length; i++) {
+      var inv = army.invaders[i];
+      if (!inv.alive) continue;
+      if (aabb(invaderRect(army, inv), b)) return inv;
+    }
+    return null;
+  }
+
+  function killInvader(state, inv) {
+    if (!inv.alive) return;
+    inv.alive = false;
+    var r = invaderRect(state.army, inv);
+    addScore(state, inv.pts);
+    emit(state, 'invaderKilled', { x: r.x, y: r.y, w: r.w, h: r.h, pts: inv.pts, kind: inv.kind });
+  }
+
+  /* 弾を SWEEP px 以下の刻みで進め、侵入を防ぐ（トンネリング対策）。 */
+  function updatePlayerBullets(state, dt) {
+    var P = CONFIG.PLAYER, travel = P.BULLET_SPEED * dt, keep = [];
+    for (var i = 0; i < state.bullets.length; i++) {
+      var b = state.bullets[i], alive = true, rest = travel;
+      while (rest > 0 && alive) {
+        var step = Math.min(CONFIG.SWEEP, rest);
+        rest -= step;
+        b.y -= step;
+        if (b.y + b.h < 0) { alive = false; break; }
+        var hit = bulletHitsBunker(state.bunkers, b, true);
+        if (hit) {
+          carveBunker(hit.bunker, hit.cx, hit.cy, 2);
+          emit(state, 'bunkerHit', { x: hit.cx * hit.bunker.cell + hit.bunker.x, y: hit.cy * hit.bunker.cell + hit.bunker.y });
+          alive = false; break;
+        }
+        if (state.ufo && aabb(state.ufo, b)) {
+          hitUfo(state, state.ufo);
+          alive = false; break;
+        }
+        var inv = firstInvaderHit(state, b);
+        if (inv) { killInvader(state, inv); alive = false; break; }
+      }
+      if (alive) keep.push(b);
+    }
+    state.bullets = keep;
+  }
+
+  /* -------------------------------------------------------------- enemy fire */
+
+  function fireEnemyBullet(state) {
+    var A = CONFIG.ARMY, army = state.army, shooters = [], c, i;
+    for (c = 0; c < A.COLS; c++) {
+      var shooter = null;
+      for (i = 0; i < army.invaders.length; i++) {
+        var inv = army.invaders[i];
+        if (!inv.alive || inv.col !== c) continue;
+        if (!shooter || inv.row > shooter.row) shooter = inv;   // 列の最下段が撃つ
+      }
+      if (!shooter) continue;
+      var r = invaderRect(army, shooter), cx = r.x + r.w / 2, busy = false;
+      for (var j = 0; j < state.enemyBullets.length; j++) {
+        var eb = state.enemyBullets[j];
+        if (Math.abs(eb.x + eb.w / 2 - cx) < A.CELL_W) busy = true;
+      }
+      if (!busy) shooters.push({ cx: cx, bottom: r.y + r.h });
+    }
+    if (!shooters.length) return false;
+    var pick = shooters[Math.min(shooters.length - 1, Math.floor(state.rng() * shooters.length))];
+    state.enemyBullets.push(makeBullet(state, pick.cx, pick.bottom, false));
+    emit(state, 'enemyShoot');
+    return true;
+  }
+
+  function updateEnemyFire(state, dt) {
+    var E = CONFIG.ENEMY_FIRE;
+    if (state.enemyBullets.length >= E.MAX) return;
+    state.fireTimer -= dt;
+    if (state.fireTimer > 0) return;
+    var ratio = aliveCount(state.army) / state.army.total;
+    var interval = Math.max(E.MIN_INTERVAL, E.BASE_INTERVAL * (0.4 + 0.6 * ratio) - 0.07 * (state.level - 1));
+    state.fireTimer = interval * (0.55 + 0.9 * state.rng());
+    fireEnemyBullet(state);
+  }
+
+  function updateEnemyBullets(state, dt) {
+    var travel = CONFIG.ENEMY_FIRE.SPEED * dt, keep = [];
+    for (var i = 0; i < state.enemyBullets.length; i++) {
+      var b = state.enemyBullets[i], alive = true, rest = travel;
+      while (rest > 0 && alive) {
+        var step = Math.min(CONFIG.SWEEP, rest);
+        rest -= step;
+        b.y += step;
+        if (b.y > CONFIG.HEIGHT) { alive = false; break; }
+        var hit = bulletHitsBunker(state.bunkers, b, false);
+        if (hit) {
+          carveBunker(hit.bunker, hit.cx, hit.cy, 2);
+          emit(state, 'bunkerHit', { x: hit.cx * hit.bunker.cell + hit.bunker.x,
+                                     y: hit.cy * hit.bunker.cell + hit.bunker.y });
+          alive = false; break;
+        }
+        if (state.player.alive && aabb(state.player, b)) { killPlayer(state); alive = false; break; }
+      }
+      if (alive) keep.push(b);
+    }
+    state.enemyBullets = keep;
+  }
+
+  /* -------------------------------------------------------------------- UFO */
+
+  function ufoScore(state) {
+    var t = CONFIG.UFO.TABLE, total = 0, i, r;
+    for (i = 0; i < t.length; i++) total += t[i].w;
+    r = state.rng() * total;
+    for (i = 0; i < t.length; i++) { r -= t[i].w; if (r <= 0) return t[i].pts; }
+    return t[0].pts;
+  }
+
+  function hitUfo(state, u) {
+    var pts = ufoScore(state);
+    addScore(state, pts);
+    state.ufo = null;
+    state.ufoTimer = randRange(state, CONFIG.UFO.MIN_DELAY, CONFIG.UFO.MAX_DELAY);
+    emit(state, 'ufoKilled', { x: u.x + u.w / 2, y: u.y + u.h / 2, pts: pts });
+    return pts;
+  }
+
+  function updateUfo(state, dt) {
+    var U = CONFIG.UFO, u = state.ufo;
+    if (u) {
+      u.x += u.vx * dt;
+      if (u.x + u.w < -8 || u.x > CONFIG.WIDTH + 8) {
+        state.ufo = null;
+        state.ufoTimer = randRange(state, U.MIN_DELAY, U.MAX_DELAY);
+        emit(state, 'ufoEscape');
+      }
+      return;
+    }
+    state.ufoTimer -= dt;
+    if (state.ufoTimer > 0) return;
+    if (aliveCount(state.army) < CONFIG.MIN_INVADERS_FOR_UFO) return;
+    var fromLeft = state.rng() < 0.5;
+    state.ufo = { x: fromLeft ? -U.W : CONFIG.WIDTH, y: U.Y, w: U.W, h: U.H,
+                  vx: fromLeft ? U.SPEED : -U.SPEED };
+    emit(state, 'ufoAppear', { fromLeft: fromLeft });
+  }
+
+  /* ------------------------------------------------------------ army / flow */
+
+  function levelClear(state) {
+    if (state.status !== 'playing') return;
+    var bonus = CONFIG.LEVEL_BONUS * state.level;
+    state.lastBonus = bonus;
+    addScore(state, bonus);
+    state.status = 'levelclear';
+    state.timer = 2.4;
+    emit(state, 'levelClear', { level: state.level, bonus: bonus });
+  }
+
+  function gameOver(state) {
+    if (state.status === 'gameover') return;
+    state.status = 'gameover';
+    state.timer = 0;
+    state.player.alive = false;
+    emit(state, 'gameOver', { score: state.score, level: state.level });
+  }
+
+  function updateArmy(state, dt) {
+    var army = state.army, A = CONFIG.ARMY, i;
+    if (!army) return;
+    if (aliveCount(army) === 0) { levelClear(state); return; }
+
+    army.stepTimer += dt;
+    var guard = 0;
+    while (army.stepTimer >= stepIntervalFor(army) && guard++ < 8) {
+      army.stepTimer -= stepIntervalFor(army);
+      var ev = stepArmy(army);
+      if (!ev) break;
+      state.stepTone = (state.stepTone + 1) % 4;
+      emit(state, 'invaderStep', { dropped: !!ev.dropped, tone: state.stepTone });
+      var b = armyBounds(army);
+      if (!b) { levelClear(state); return; }
+      if (b.maxY >= CONFIG.BUNKER.Y - A.STEP_X) {
+        // インベーダーはバンカーを削りながら降りてくる
+        for (i = 0; i < army.invaders.length; i++) {
+          if (army.invaders[i].alive) eraseBunkersInRect(state.bunkers, invaderRect(army, army.invaders[i]));
+        }
+      }
+      if (b.maxY >= state.player.y) {   // 最下段が自機の高さに到達 = 侵略成功
+        emit(state, 'invasion');
+        gameOver(state);
+        return;
+      }
+    }
+    if (aliveCount(army) === 0) levelClear(state);
+  }
+
+  function updatePlaying(state, dt, input) {
+    updatePlayer(state, dt, input);
+    updatePlayerBullets(state, dt);
+    if (state.status !== 'playing') return;
+    updateArmy(state, dt);
+    if (state.status !== 'playing') return;
+    updateEnemyFire(state, dt);
+    updateEnemyBullets(state, dt);
+    if (state.status !== 'playing') return;
+    updateUfo(state, dt);
+  }
+
+  /** 固定タイムステップで 1 回分の更新。input = { left, right, fire, pointerX } */
+  function update(state, dt, input) {
+    input = input || {};
+    state.events.length = 0;
+    state.time += dt;
+    switch (state.status) {
+      case 'playing':
+        updatePlaying(state, dt, input);
+        break;
+      case 'dying':
+        state.timer -= dt;
+        if (state.timer <= 0) {
+          if (state.lives <= 0) gameOver(state);
+          else { state.player.alive = true; state.status = 'playing'; }
+        }
+        break;
+      case 'levelclear':
+        state.timer -= dt;
+        if (state.timer <= 0) {
+          startLevel(state, state.level + 1);
+          emit(state, 'nextLevel', { level: state.level });
+          state.status = 'playing';
+        }
+        break;
+      default:
+        break;   // title / paused / gameover は時間のみ進む
+    }
+    return state;
+  }
+
+  /* ------------------------------------------------------------------ export */
+
+  root.InvaderCore = {
+    CONFIG: CONFIG,
+    KIND_BY_ROW: KIND_BY_ROW,
+    clamp: clamp, aabb: aabb,
+    createBunker: createBunker, createBunkers: createBunkers, bunkerSolid: bunkerSolid,
+    carveBunker: carveBunker, eraseBunkersInRect: eraseBunkersInRect,
+    bulletHitsBunker: bulletHitsBunker,
+    createArmy: createArmy, invaderRect: invaderRect, aliveCount: aliveCount,
+    armyBounds: armyBounds, stepIntervalFor: stepIntervalFor, stepArmy: stepArmy,
+    createState: createState, startGame: startGame, startLevel: startLevel,
+    togglePause: togglePause, addScore: addScore,
+    makeBullet: makeBullet, killInvader: killInvader, killPlayer: killPlayer,
+    fireEnemyBullet: fireEnemyBullet, updateEnemyFire: updateEnemyFire,
+    updatePlayerBullets: updatePlayerBullets, updateEnemyBullets: updateEnemyBullets,
+    ufoScore: ufoScore, hitUfo: hitUfo, updateUfo: updateUfo,
+    levelClear: levelClear, gameOver: gameOver, updateArmy: updateArmy,
+    updatePlaying: updatePlaying, update: update
+  };
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+</script>
+
+
+
+<!-- =========================================================================
+     invader-game : 描画 / 入力 / サウンド（InvaderCore のロジックを駆動する）
+     ========================================================================= -->
+<script id="invader-game">
+(function () {
+  'use strict';
+
+  var CORE = window.InvaderCore;
+  var CONFIG = CORE.CONFIG;
+  var W = CONFIG.WIDTH, H = CONFIG.HEIGHT, SCALE = 3;
+
+  /* ------------------------------------------------------------ pixel art */
+
+  var SPRITES = {
+    squidA: [
+      '00011000', '00111100', '01111110', '11011011',
+      '11111111', '00100100', '01011010', '10100101'
+    ],
+    squidB: [
+      '00011000', '00111100', '01111110', '11011011',
+      '11111111', '01011010', '10000001', '01000010'
+    ],
+    crabA: [
+      '00100000100', '00010001000', '00111111100', '01101110110',
+      '11111111111', '10111111101', '10100000101', '00011011000'
+    ],
+    crabB: [
+      '00100000100', '10010001001', '10111111101', '11101110111',
+      '11111111111', '01111111110', '00100000100', '01000000010'
+    ],
+    octoA: [
+      '000011110000', '011111111110', '111111111111', '110111011011',
+      '111111111111', '000110011000', '001101101100', '110000000011'
+    ],
+    octoB: [
+      '000011110000', '011111111110', '111111111111', '110111011011',
+      '111111111111', '001110111000', '011001100110', '000110001100'
+    ],
+    player: [
+      '0000001000000', '0000011100000', '0000011100000', '0111111111110',
+      '1111111111111', '1111111111111', '1111111111111', '1111111111111'
+    ],
+    ufo: [
+      '0000011111100000', '0001111111111000', '0011111111111100', '0110110110110110',
+      '1111111111111111', '0011100110011100', '0001100000011000'
+    ],
+    boom: [
+      '0001000100000', '1000100010001', '0000000000000', '0010000010000',
+      '0100000000010', '0010000010000', '0000000000000', '1000100010001'
+    ]
+  };
+
+  var COLORS = {
+    squid: '#ffffff', crab: '#7ef9ff', octopus: '#a6ff5e',
+    player: '#4dff9a', ufo: '#ff5d8f', boom: '#ffd166', bunker: '#38e05a'
+  };
+  var CACHE_NAME = { squid: 'squid', crab: 'crab', octopus: 'octo' };
+
+  function drawPixels(g, rows, ox, oy) {
+    for (var y = 0; y < rows.length; y++) {
+      var row = rows[y];
+      for (var x = 0; x < row.length; x++) {
+        if (row.charAt(x) === '1') g.fillRect(x * SCALE + ox, y * SCALE + oy, SCALE, SCALE);
+      }
+    }
+  }
+
+  function buildSprite(rows, color) {
+    var w = rows[0].length * SCALE, h = rows.length * SCALE;
+    var cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    var g = cv.getContext('2d');
+    var offs = [[1, 0], [-1, 0], [0, 1], [0, -1], [2, 0], [-2, 0], [0, 2], [0, -2]];
+    g.fillStyle = color;
+    g.globalAlpha = 0.20;
+    for (var i = 0; i < offs.length; i++) drawPixels(g, rows, offs[i][0] * SCALE, offs[i][1] * SCALE);
+    g.globalAlpha = 1;
+    drawPixels(g, rows, 0, 0);
+    return cv;
+  }
+
+  var IMG = {};
+  function buildAllSprites() {
+    IMG.squidA = buildSprite(SPRITES.squidA, COLORS.squid);
+    IMG.squidB = buildSprite(SPRITES.squidB, COLORS.squid);
+    IMG.crabA = buildSprite(SPRITES.crabA, COLORS.crab);
+    IMG.crabB = buildSprite(SPRITES.crabB, COLORS.crab);
+    IMG.octoA = buildSprite(SPRITES.octoA, COLORS.octopus);
+    IMG.octoB = buildSprite(SPRITES.octoB, COLORS.octopus);
+    IMG.player = buildSprite(SPRITES.player, COLORS.player);
+    IMG.ufo = buildSprite(SPRITES.ufo, COLORS.ufo);
+    IMG.boom = buildSprite(SPRITES.boom, COLORS.boom);
+
+    // 走査線パターン（レトロなブラウン管風）
+    var sl = document.createElement('canvas');
+    sl.width = 1; sl.height = 3;
+    var sg = sl.getContext('2d');
+    sg.fillStyle = 'rgba(0,0,0,0.22)';
+    sg.fillRect(0, 2, 1, 1);
+    IMG.scanline = ctx.createPattern(sl, 'repeat');
+  }
+
+  function invaderImage(kind, frame) {
+    return IMG[CACHE_NAME[kind] + (frame ? 'B' : 'A')];
+  }
+
+  /* -------------------------------------------------------------- サウンド
+     Web Audio API で生成するので音声ファイルは不要。M キーでミュート。      */
+
+  var Sound = (function () {
+    var actx = null, master = null, noiseBuf = null, ufoNodes = null, muted = false;
+
+    function ensure() {
+      if (!actx) {
+        var AC = window.AudioContext || window.webkitAudioContext;
+        if (!AC) return null;
+        actx = new AC();
+        master = actx.createGain();
+        master.gain.value = 0.5;
+        master.connect(actx.destination);
+        var len = Math.floor(actx.sampleRate * 0.5);
+        noiseBuf = actx.createBuffer(1, len, actx.sampleRate);
+        var d = noiseBuf.getChannelData(0);
+        for (var i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+      }
+      if (actx.state === 'suspended') { try { actx.resume(); } catch (e) {} }
+      return actx;
+    }
+
+    function tone(freq, dur, type, vol, freqEnd, delay) {
+      if (muted) return;
+      var c = ensure(); if (!c) return;
+      var t = c.currentTime + (delay || 0);
+      var o = c.createOscillator(), g = c.createGain();
+      o.type = type || 'square';
+      o.frequency.setValueAtTime(freq, t);
+      if (freqEnd) o.frequency.exponentialRampToValueAtTime(Math.max(20, freqEnd), t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol || 0.07, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(master);
+      o.start(t); o.stop(t + dur + 0.03);
+    }
+
+    function noise(dur, vol, f0, f1) {
+      if (muted) return;
+      var c = ensure(); if (!c) return;
+      var t = c.currentTime;
+      var s = c.createBufferSource(), g = c.createGain(), f = c.createBiquadFilter();
+      s.buffer = noiseBuf; s.loop = true;
+      f.type = 'lowpass';
+      f.frequency.setValueAtTime(f0 || 2000, t);
+      if (f1) f.frequency.exponentialRampToValueAtTime(Math.max(60, f1), t + dur);
+      g.gain.setValueAtTime(vol || 0.12, t);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      s.connect(f); f.connect(g); g.connect(master);
+      s.start(t); s.stop(t + dur + 0.03);
+    }
+
+    function arp(freqs, dur, type, vol, gap) {
+      for (var i = 0; i < freqs.length; i++) tone(freqs[i], dur, type, vol, null, i * gap);
+    }
+
+    function ufoStop() {
+      if (!ufoNodes) return;
+      var t = actx ? actx.currentTime : 0;
+      try {
+        ufoNodes.g.gain.cancelScheduledValues(t);
+        ufoNodes.g.gain.setValueAtTime(Math.max(0.0001, ufoNodes.g.gain.value), t);
+        ufoNodes.g.gain.exponentialRampToValueAtTime(0.0001, t + 0.06);
+        ufoNodes.o.stop(t + 0.12);
+        ufoNodes.lfo.stop(t + 0.12);
+      } catch (e) { /* 停止済みでも無視 */ }
+      ufoNodes = null;
+    }
+
+    function ufoStart() {
+      if (muted) return;
+      var c = ensure(); if (!c) return;
+      ufoStop();
+      var t = c.currentTime;
+      var o = c.createOscillator(), g = c.createGain(), lfo = c.createOscillator(), lg = c.createGain();
+      o.type = 'sawtooth'; o.frequency.setValueAtTime(480, t);
+      lfo.type = 'triangle'; lfo.frequency.setValueAtTime(12, t); lg.gain.value = 140;
+      lfo.connect(lg); lg.connect(o.frequency);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.045, t + 0.05);
+      o.connect(g); g.connect(master);
+      o.start(t); lfo.start(t);
+      ufoNodes = { o: o, g: g, lfo: lfo };
+    }
+
+    var MARCH = [104, 92, 78, 64];
+
+    function setMuted(v) { muted = !!v; if (muted) ufoStop(); return muted; }
+
+    return {
+      ensure: ensure,
+      isMuted: function () { return muted; },
+      toggleMute: function () { return setMuted(!muted); },
+      march: function (i) { tone(MARCH[i % 4], 0.11, 'square', 0.08); },
+      shoot: function () { tone(900, 0.09, 'square', 0.06, 240); },
+      enemyShoot: function () { tone(360, 0.12, 'sawtooth', 0.045, 120); },
+      invaderHit: function () { noise(0.16, 0.13, 2600, 300); tone(300, 0.12, 'square', 0.05, 120); },
+      playerHit: function () { noise(0.7, 0.17, 1400, 80); tone(220, 0.6, 'sawtooth', 0.06, 40); },
+      bunkerHit: function () { noise(0.08, 0.06, 900, 300); },
+      ufoStart: ufoStart, ufoStop: ufoStop,
+      levelClear: function () { arp([523, 659, 784, 1046], 0.14, 'square', 0.07, 0.12); },
+      extraLife: function () { arp([660, 880, 1320], 0.12, 'triangle', 0.07, 0.09); },
+      gameOver: function () { arp([392, 330, 262, 196], 0.34, 'sawtooth', 0.07, 0.22); }
+    };
+  })();
+
+  /* ------------------------------------------------------------ 状態 / 記録 */
+
+  var canvas = document.getElementById('screen');
+  var ctx = canvas.getContext('2d');
+  var HS_KEY = 'invader.highscore';
+
+  function loadHigh() {
+    try { return parseInt(window.localStorage.getItem(HS_KEY) || '0', 10) || 0; }
+    catch (e) { return 0; }
+  }
+  function saveHigh(v) {
+    try { window.localStorage.setItem(HS_KEY, String(v)); } catch (e) { /* プライベートモード等 */ }
+  }
+
+  var state = CORE.createState({ highScore: loadHigh() });
+  var effects = [];   // 爆発エフェクト
+  var popups = [];    // 加点表示
+  var lastSavedHigh = state.highScore;
+
+  function addBoom(x, y, w, h) { effects.push({ x: x, y: y, w: w, h: h, t: 0, dur: 0.34 }); }
+  function addPopup(x, y, text) { popups.push({ x: x, y: y, text: text, t: 0, dur: 0.9 }); }
+
+  function clearVisuals() { effects.length = 0; popups.length = 0; }
+
+  function updateVisuals(dt) {
+    var i;
+    for (i = effects.length - 1; i >= 0; i--) {
+      effects[i].t += dt;
+      if (effects[i].t >= effects[i].dur) effects.splice(i, 1);
+    }
+    for (i = popups.length - 1; i >= 0; i--) {
+      popups[i].t += dt;
+      if (popups[i].t >= popups[i].dur) popups.splice(i, 1);
+    }
+  }
+
+  /* コアが発行したイベントを音とエフェクトに変換する */
+  function handleEvents() {
+    var i, ev;
+    for (i = 0; i < state.events.length; i++) {
+      ev = state.events[i];
+      switch (ev.type) {
+        case 'invaderStep': Sound.march(ev.tone); break;
+        case 'playerShoot': Sound.shoot(); break;
+        case 'enemyShoot': Sound.enemyShoot(); break;
+        case 'invaderKilled':
+          Sound.invaderHit();
+          addBoom(ev.x, ev.y, ev.w, ev.h);
+          addPopup(ev.x + ev.w / 2, ev.y, '+' + ev.pts);
+          break;
+        case 'playerKilled':
+          Sound.playerHit(); Sound.ufoStop();
+          break;
+        case 'bunkerHit': Sound.bunkerHit(); break;
+        case 'ufoAppear': Sound.ufoStart(); break;
+        case 'ufoKilled':
+          Sound.ufoStop(); Sound.invaderHit();
+          addBoom(ev.x - 24, ev.y - 10, 48, 21);
+          addPopup(ev.x, ev.y, '+' + ev.pts);
+          break;
+        case 'ufoEscape': Sound.ufoStop(); break;
+        case 'extraLife': Sound.extraLife(); addPopup(W / 2, 300, 'EXTRA LIFE!'); break;
+        case 'levelClear': Sound.levelClear(); break;
+        case 'gameOver':
+          Sound.ufoStop(); Sound.gameOver();
+          saveHigh(state.highScore);
+          lastSavedHigh = state.highScore;
+          break;
+        default: break;
+      }
+    }
+    if (state.highScore > lastSavedHigh) { saveHigh(state.highScore); lastSavedHigh = state.highScore; }
+  }
+
+  /* ------------------------------------------------------------------ 入力 */
+
+  var input = { left: false, right: false, fire: false, pointerX: null };
+  var KEY_LEFT = { ArrowLeft: 1, KeyA: 1 };
+  var KEY_RIGHT = { ArrowRight: 1, KeyD: 1 };
+
+  function startOrRestart() {
+    if (state.status === 'title' || state.status === 'gameover') {
+      CORE.startGame(state);
+      clearVisuals();
+      return true;
+    }
+    return false;
+  }
+
+  function hardReset() {
+    CORE.startGame(state);
+    clearVisuals();
+  }
+
+  window.addEventListener('keydown', function (e) {
+    var c = e.code;
+    Sound.ensure();
+    if (KEY_LEFT[c]) { input.left = true; e.preventDefault(); }
+    else if (KEY_RIGHT[c]) { input.right = true; e.preventDefault(); }
+    else if (c === 'Space' || c === 'KeyW' || c === 'ArrowUp') {
+      e.preventDefault();
+      if (!e.repeat) startOrRestart();
+      input.fire = true;
+    } else if (c === 'Enter') { startOrRestart(); }
+    else if (c === 'KeyP' || c === 'Escape') { CORE.togglePause(state); }
+    else if (c === 'KeyM') {
+      var m = Sound.toggleMute();
+      if (!m && state.ufo) Sound.ufoStart();
+    } else if (c === 'KeyR') { hardReset(); }
+  }, { passive: false });
+
+  window.addEventListener('keyup', function (e) {
+    var c = e.code;
+    if (KEY_LEFT[c]) input.left = false;
+    else if (KEY_RIGHT[c]) input.right = false;
+    else if (c === 'Space' || c === 'KeyW' || c === 'ArrowUp') input.fire = false;
+  });
+
+  window.addEventListener('blur', function () {
+    input.left = false; input.right = false; input.fire = false; input.pointerX = null;
+  });
+
+  /* ポインタ / タッチ：ドラッグで移動、押している間は射撃 */
+  function canvasX(e) {
+    var r = canvas.getBoundingClientRect();
+    return (e.clientX - r.left) * (W / Math.max(1, r.width));
+  }
+
+  canvas.addEventListener('pointerdown', function (e) {
+    Sound.ensure();
+    if (canvas.setPointerCapture) { try { canvas.setPointerCapture(e.pointerId); } catch (err) {} }
+    input.pointerX = canvasX(e);
+    if (e.pointerType !== 'mouse' || e.button === 0) input.fire = true;
+    if (!startOrRestart() && state.status === 'paused') CORE.togglePause(state);
+    e.preventDefault();
+  }, { passive: false });
+
+  canvas.addEventListener('pointermove', function (e) {
+    if (e.pointerType === 'mouse' && e.buttons === 0) return;   // マウスはドラッグ中のみ追従
+    input.pointerX = canvasX(e);
+    e.preventDefault();
+  }, { passive: false });
+
+  function pointerEnd() { input.fire = false; input.pointerX = null; }
+  canvas.addEventListener('pointerup', pointerEnd);
+  canvas.addEventListener('pointercancel', pointerEnd);
+  canvas.addEventListener('pointerleave', pointerEnd);
+
+  /* ------------------------------------------------------------------ 描画 */
+
+  var bunkerCache = [];
+
+  /* バンカーはセル単位で穴が開くため、変化があった時だけ canvas を作り直す */
+  function bunkerImage(bk, idx) {
+    var cache = bunkerCache[idx];
+    if (!cache || cache.cols !== bk.cols || cache.rows !== bk.rows) {
+      cache = bunkerCache[idx] = { cols: bk.cols, rows: bk.rows, grid: null, cv: document.createElement('canvas') };
+      cache.cv.width = bk.w; cache.cv.height = bk.h;
+    }
+    var same = !!cache.grid && cache.grid.length === bk.grid.length, i, r, c;
+    if (same) {
+      for (i = 0; i < bk.grid.length; i++) {
+        if (cache.grid[i] !== bk.grid[i]) { same = false; break; }
+      }
+    }
+    if (!same) {
+      var g = cache.cv.getContext('2d');
+      g.clearRect(0, 0, bk.w, bk.h);
+      g.fillStyle = COLORS.bunker;
+      for (r = 0; r < bk.rows; r++) {
+        for (c = 0; c < bk.cols; c++) {
+          if (bk.grid[r * bk.cols + c]) g.fillRect(c * bk.cell, r * bk.cell, bk.cell, bk.cell);
+        }
+      }
+      cache.grid = bk.grid.slice();
+    }
+    return cache.cv;
+  }
+
+  function drawBunkers() {
+    for (var i = 0; i < state.bunkers.length; i++) {
+      var bk = state.bunkers[i];
+      ctx.drawImage(bunkerImage(bk, i), bk.x, bk.y);
+    }
+  }
+
+  function drawArmy() {
+    var army = state.army;
+    if (!army) return;
+    for (var i = 0; i < army.invaders.length; i++) {
+      var inv = army.invaders[i];
+      if (!inv.alive) continue;
+      var r = CORE.invaderRect(army, inv);
+      ctx.drawImage(invaderImage(inv.kind, army.frame), Math.round(r.x), Math.round(r.y));
+    }
+  }
+
+  function drawBullets() {
+    var i, b;
+    ctx.fillStyle = '#f2ffd0';
+    for (i = 0; i < state.bullets.length; i++) {
+      b = state.bullets[i];
+      ctx.fillRect(Math.round(b.x), Math.round(b.y), b.w, b.h);
+    }
+    ctx.fillStyle = '#ff8a5c';
+    for (i = 0; i < state.enemyBullets.length; i++) {
+      b = state.enemyBullets[i];
+      ctx.fillRect(Math.round(b.x), Math.round(b.y), b.w, b.h);
+    }
+  }
+
+  function drawPlayer() {
+    var p = state.player;
+    if (state.status === 'dying') {
+      // 被弾：爆発エフェクトを大きくしながら消す
+      var k = 1 - Math.max(0, state.timer) / CONFIG.PLAYER.RESPAWN;
+      var grow = 1 + k * 0.9;
+      ctx.globalAlpha = Math.max(0, 1 - k);
+      ctx.drawImage(IMG.boom,
+        Math.round(p.x + p.w / 2 - IMG.boom.width * grow / 2),
+        Math.round(p.y + p.h / 2 - IMG.boom.height * grow / 2),
+        Math.round(IMG.boom.width * grow), Math.round(IMG.boom.height * grow));
+      ctx.globalAlpha = 1;
+      return;
+    }
+    if (!p.alive) return;
+    ctx.drawImage(IMG.player, Math.round(p.x), Math.round(p.y));
+  }
+
+  function drawUfo() {
+    if (!state.ufo) return;
+    ctx.drawImage(IMG.ufo, Math.round(state.ufo.x), Math.round(state.ufo.y));
+  }
+
+  function drawEffects() {
+    var i, k;
+    for (i = 0; i < effects.length; i++) {
+      var e = effects[i];
+      k = e.t / e.dur;
+      var grow = 0.9 + k * 0.8;
+      ctx.globalAlpha = Math.max(0, 1 - k);
+      ctx.drawImage(IMG.boom,
+        Math.round(e.x + e.w / 2 - IMG.boom.width * grow / 2),
+        Math.round(e.y + e.h / 2 - IMG.boom.height * grow / 2),
+        Math.round(IMG.boom.width * grow), Math.round(IMG.boom.height * grow));
+    }
+    ctx.globalAlpha = 1;
+    ctx.font = 'bold 18px Consolas, "Courier New", monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'alphabetic';
+    for (i = 0; i < popups.length; i++) {
+      var p = popups[i];
+      k = p.t / p.dur;
+      ctx.globalAlpha = Math.max(0, 1 - k);
+      ctx.fillStyle = '#ffe066';
+      ctx.fillText(p.text, Math.round(p.x - 14), Math.round(p.y - k * 28));
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  function pad(v, n) {
+    var s = String(Math.max(0, Math.floor(v)));
+    while (s.length < n) s = '0' + s;
+    return s;
+  }
+
+  function drawHud() {
+    ctx.font = 'bold 22px Consolas, "Courier New", monospace';
+    ctx.textBaseline = 'alphabetic';
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#8affc1';
+    ctx.fillText('SCORE ' + pad(state.score, 6), 20, 30);
+    ctx.textAlign = 'center';
+    ctx.fillStyle = '#ffd166';
+    ctx.fillText('HI ' + pad(state.highScore, 6), W / 2, 30);
+    ctx.textAlign = 'right';
+    ctx.fillStyle = '#8fd8ff';
+    ctx.fillText('LEVEL ' + state.level, W - 20, 30);
+
+    // 残機（自機アイコン）
+    ctx.textAlign = 'left';
+    ctx.fillStyle = '#4dff9a';
+    ctx.font = 'bold 18px Consolas, "Courier New", monospace';
+    ctx.fillText('LIVES', 20, H - 14);
+    var n = Math.min(state.lives, 6);
+    for (var i = 0; i < n; i++) {
+      ctx.drawImage(IMG.player, 96 + i * 44, H - 34);
+    }
+    ctx.textAlign = 'right';
+    ctx.fillStyle = Sound.isMuted() ? '#5c6b7a' : '#7b8a99';
+    ctx.fillText(Sound.isMuted() ? 'SOUND OFF (M)' : 'SOUND ON (M)', W - 20, H - 14);
+  }
+
+  /* ------------------------------------------------------ オーバーレイ表示 */
+
+  function dim(alpha) {
+    ctx.fillStyle = 'rgba(4,6,11,' + alpha + ')';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  function center(text, y, color, size, glow) {
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'alphabetic';
+    ctx.font = 'bold ' + size + 'px Consolas, "Courier New", monospace';
+    if (glow) {
+      ctx.shadowColor = color;
+      ctx.shadowBlur = 18;
+    }
+    ctx.fillStyle = color;
+    ctx.fillText(text, W / 2, y);
+    ctx.shadowBlur = 0;
+  }
+
+  /* 点滅（完全には消さず、ゆっくり明滅させる） */
+  function pulse() { ctx.globalAlpha = 0.45 + 0.55 * Math.abs(Math.sin(state.time * 3)); }
+
+  function drawTitle() {
+    dim(0.78);
+    var frame = Math.floor(state.time * 3) % 2;
+    var kinds = ['squid', 'crab', 'octopus'];
+    var labels = ['= 30 PTS', '= 20 PTS', '= 10 PTS'];
+    var colors = [COLORS.squid, COLORS.crab, COLORS.octopus];
+    var i, y;
+    center('SPACE', 140, '#7ef9ff', 62, true);
+    center('INVADERS', 204, '#a6ff5e', 62, true);
+    for (i = 0; i < 3; i++) {
+      y = 240 + i * 42;
+      ctx.drawImage(invaderImage(kinds[i], frame), 268, y);
+      ctx.textAlign = 'left';
+      ctx.font = 'bold 22px Consolas, "Courier New", monospace';
+      ctx.fillStyle = colors[i];
+      ctx.fillText(labels[i], 318, y + 24);
+    }
+    y = 240 + 3 * 42;
+    ctx.drawImage(IMG.ufo, 262, y);
+    ctx.textAlign = 'left';
+    ctx.font = 'bold 22px Consolas, "Courier New", monospace';
+    ctx.fillStyle = COLORS.ufo;
+    ctx.fillText('= ? MYSTERY', 318, y + 18);
+
+    pulse();
+    center('PRESS SPACE / TAP TO START', 448, '#ffe066', 26, false);
+    ctx.globalAlpha = 1;
+    center('HI-SCORE ' + pad(state.highScore, 6), 486, '#8fd8ff', 20, false);
+    center('\u2190 \u2192 / A D : MOVE　SPACE : FIRE　P : PAUSE　M : SOUND', 518, '#6b8496', 15, false);
+    center('\u30BF\u30C3\u30C1 : \u30C9\u30E9\u30C3\u30B0\u3067\u79FB\u52D5 / \u30BF\u30C3\u30D7\u3067\u5C04\u6483', 540, '#4f6478', 14, false);
+  }
+
+  function drawPaused() {
+    dim(0.6);
+    center('PAUSED', 300, '#ffd166', 48, true);
+    center('PRESS P / TAP TO RESUME', 348, '#8fd8ff', 20, false);
+  }
+
+  function drawLevelClear() {
+    dim(0.55);
+    center('LEVEL ' + state.level + ' CLEAR', 280, '#a6ff5e', 44, true);
+    center('BONUS +' + state.lastBonus, 330, '#ffe066', 26, false);
+  }
+
+  function drawGameOver() {
+    dim(0.72);
+    center('GAME OVER', 258, '#ff5d8f', 56, true);
+    center('SCORE ' + pad(state.score, 6), 316, '#8affc1', 26, false);
+    center('HI-SCORE ' + pad(state.highScore, 6), 352, '#8fd8ff', 22, false);
+    pulse();
+    center('PRESS SPACE / TAP TO RETRY', 424, '#ffe066', 24, false);
+    ctx.globalAlpha = 1;
+  }
+
+  function drawOverlay() {
+    if (state.status === 'title') drawTitle();
+    else if (state.status === 'paused') drawPaused();
+    else if (state.status === 'levelclear') drawLevelClear();
+    else if (state.status === 'gameover') drawGameOver();
+  }
+
+  function render() {
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = '#04060b';
+    ctx.fillRect(0, 0, W, H);
+    drawBunkers();
+    drawArmy();
+    drawUfo();
+    drawBullets();
+    drawEffects();
+    drawPlayer();
+    drawHud();
+    drawOverlay();
+    ctx.fillStyle = IMG.scanline;   // 走査線（ブラウン管風）
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  /* ------------------------------------------------------------ メインループ */
+
+  var FIXED = 1 / 60, MAX_STEPS = 5, acc = 0, lastTs = 0;
+  var bot = false;   // ?demo=1 の自動プレイ用
+
+  /* 動作確認用の簡易 CPU（?demo=1 で有効） */
+  function botThink() {
+    if (state.status === 'title' || state.status === 'gameover') {
+      input.fire = true;
+      startOrRestart();
+      return;
+    }
+    if (state.status !== 'playing') { input.fire = false; return; }
+    var army = state.army, target = null, best = -1;
+    for (var i = 0; i < army.invaders.length; i++) {
+      var inv = army.invaders[i];
+      if (inv.alive && inv.row > best) { best = inv.row; target = inv; }
+    }
+    if (target) {
+      var r = CORE.invaderRect(army, target);
+      input.pointerX = r.x + r.w / 2;
+    }
+    input.fire = true;
+  }
+
+  function frame(ts) {
+    if (!lastTs) lastTs = ts;
+    var dt = Math.min(0.25, (ts - lastTs) / 1000);
+    lastTs = ts;
+
+    if (bot) botThink();
+
+    acc += dt;
+    var steps = 0;
+    while (acc >= FIXED && steps < MAX_STEPS) {
+      CORE.update(state, FIXED, input);
+      updateVisuals(FIXED);
+      handleEvents();
+      acc -= FIXED;
+      steps++;
+    }
+    if (steps >= MAX_STEPS) acc = 0;   // 追いつけない時は時間を捨てる
+
+    render();
+    window.requestAnimationFrame(frame);
+  }
+
+  /* ------------------------------------------------------------------ 起動 */
+
+  function boot() {
+    buildAllSprites();
+
+    var q = window.location.search || '';
+    var m = /[?&]level=(\d+)/.exec(q);
+    var auto = /[?&](demo|autostart)=1/.test(q);
+
+    if (/[?&]mute=1/.test(q)) Sound.toggleMute();
+
+    if (auto) {
+      bot = /[?&]demo=1/.test(q);
+      CORE.startGame(state);
+      clearVisuals();
+    }
+    if (m) {
+      if (!auto) CORE.startGame(state);
+      var lv = Math.max(1, Math.min(99, parseInt(m[1], 10) || 1));
+      CORE.startLevel(state, lv);
+      state.status = 'playing';
+      clearVisuals();
+    }
+
+    window.requestAnimationFrame(frame);
+  }
+
+  boot();
+})();
+</script>
+</body>
+</html>
